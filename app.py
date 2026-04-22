@@ -4,6 +4,8 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 
+TRADIER_TOKEN = "gHGFAMPkB0GSMK2mj8FXHkf01R0B"
+
 st.set_page_config(layout="wide")
 st_autorefresh(interval=15000, key="refresh")
 
@@ -47,10 +49,10 @@ with col_top3:
 # VENCIMENTO + FONTE (🔥 ADIÇÃO AQUI, sem mexer no resto)
 with col_top4:
     data_source = st.selectbox(
-        "Fonte",
-        ["Yahoo", "Tradier"],
-        label_visibility="collapsed"
-    )
+    "Fonte",
+    ["Fonte 1", "Fonte 2"],
+    label_visibility="collapsed"
+)
 
     ticker = yf.Ticker(ticker_symbol)
 
@@ -61,24 +63,90 @@ with col_top4:
     )
 
 # =========================
-# DADOS (YAHOO / TRADIER HOOK)
+# DADOS (FONTE 1 / FONTE 2)
 # =========================
+import requests
 
-# 🔵 YAHOO (ATUAL)
-if data_source == "Yahoo":
+# 🔵 FONTE 1 = YAHOO (ORIGINAL, SEM CONVERSÃO)
+if data_source == "Fonte 1":
+
+    ticker = yf.Ticker(ticker_symbol)
+
     opt = ticker.option_chain(selected_exp)
     calls = opt.calls
     puts = opt.puts
 
-# 🟠 TRADIER (PLACEHOLDER - ainda não conectado)
-else:
-    # mantém estrutura igual pra não quebrar o sistema
-    opt = ticker.option_chain(selected_exp)
-    calls = opt.calls
-    puts = opt.puts
+    price = ticker.history(period="1d")["Close"].iloc[-1]
 
-price = ticker.history(period="1d")["Close"].iloc[-1]
 
+# 🟠 FONTE 2 = TRADIER (COM CONVERSÃO QQQ → NDX)
+elif data_source == "Fonte 2":
+
+    headers = {
+        "Authorization": f"Bearer {TRADIER_TOKEN}",
+        "Accept": "application/json"
+    }
+
+    try:
+        # preços base
+        qqq_price = yf.Ticker("QQQ").history(period="1d")["Close"].iloc[-1]
+        ndx_price = yf.Ticker("^NDX").history(period="1d")["Close"].iloc[-1]
+
+        fator = ndx_price / qqq_price
+        price = ndx_price
+
+        # expiração Tradier
+        url_exp = "https://api.tradier.com/v1/markets/options/expirations"
+        exp_data = requests.get(url_exp, headers=headers, params={"symbol": "QQQ"}).json()
+
+        expiration = exp_data["expirations"]["date"][0]
+
+        # chain Tradier
+        url_chain = "https://api.tradier.com/v1/markets/options/chains"
+        params = {
+            "symbol": "QQQ",
+            "expiration": expiration,
+            "greeks": "true"
+        }
+
+        data = requests.get(url_chain, headers=headers, params=params).json()
+
+        if "options" not in data or data["options"] is None:
+            st.error("Tradier não retornou dados")
+            st.stop()
+
+        df_tradier = pd.DataFrame(data["options"]["option"])
+
+        calls = df_tradier[df_tradier["option_type"] == "call"].copy()
+        puts = df_tradier[df_tradier["option_type"] == "put"].copy()
+
+        # padronização
+        calls.rename(columns={
+            "open_interest": "openInterest",
+            "implied_volatility": "impliedVolatility"
+        }, inplace=True)
+
+        puts.rename(columns={
+            "open_interest": "openInterest",
+            "implied_volatility": "impliedVolatility"
+        }, inplace=True)
+
+        # garantir colunas
+        for df_ in [calls, puts]:
+            if "impliedVolatility" not in df_.columns:
+                df_["impliedVolatility"] = 0.2
+            if "openInterest" not in df_.columns:
+                df_["openInterest"] = 0
+            if "volume" not in df_.columns:
+                df_["volume"] = 0
+
+        # 🔥 conversão QQQ → NDX
+        calls["strike"] = calls["strike"] * fator
+        puts["strike"] = puts["strike"] * fator
+
+    except Exception as e:
+        st.error(f"Erro Tradier: {e}")
+        st.stop()
 # =========================
 # HISTÓRICO (REAÇÃO + FILTRO)
 # =========================
@@ -116,14 +184,23 @@ gex_df = pd.concat([
 # =========================
 # FILTRO
 # =========================
-range_points = 700
+range_points = price * 0.03
 df = flow_df.join(gex_df, how="outer").fillna(0)
-df = df[(df.index > price-range_points)&(df.index < price+range_points)]
 
-# GARANTIR DADOS VISÍVEIS
-df = df[(df["Calls"] > 0) | (df["Puts"] > 0)]
+df_filtered = df[(df.index > price-range_points)&(df.index < price+range_points)]
+df_filtered = df_filtered[(df_filtered["Calls"] > 0) | (df_filtered["Puts"] > 0)]
 
+# 🔥 fallback inteligente
+if df_filtered.empty:
+    st.warning("Range vazio → exibindo todos os níveis disponíveis")
+    df = df[(df["Calls"] > 0) | (df["Puts"] > 0)]
+else:
+    df = df_filtered
 # WALLS
+if df.empty:
+    st.warning("Sem dados suficientes nessa região de preço")
+    st.stop()
+
 call_wall = df["Calls"].idxmax()
 put_wall = df["Puts"].idxmax()
 
@@ -169,11 +246,71 @@ sentiment_box.markdown(f"""
 """, unsafe_allow_html=True)
 
 # =========================
+# IMPORTS
+# =========================
+import time
+import streamlit as st
+import streamlit.components.v1 as components
+
+# =========================
+# ESTADOS INICIAIS
+# =========================
+if "sound_on" not in st.session_state:
+    st.session_state.sound_on = True
+
+if "audio_enabled" not in st.session_state:
+    st.session_state.audio_enabled = False
+
+if "last_alert" not in st.session_state:
+    st.session_state.last_alert = None
+
+
+# =========================
+# ATIVAÇÃO DE SOM (OBRIGATÓRIA)
+# =========================
+if not st.session_state.audio_enabled:
+    if st.button("🔊 Ativar som"):
+        st.session_state.audio_enabled = True
+
+        components.html("""
+            <script>
+            const audio = new Audio("https://www.soundjay.com/buttons/sounds/button-09.mp3");
+            audio.play();
+            </script>
+        """, height=0)
+
+
+# =========================
+# BOTÃO DE SOM (DIREITA)
+# =========================
+st.markdown("""
+<style>
+div.stButton > button {
+    font-size: 10px;
+    padding: 2px 6px;
+    background-color: transparent;
+    border: 1px solid #333;
+    border-radius: 6px;
+}
+div.stButton > button:hover {
+    background-color: rgba(255,255,255,0.05);
+}
+</style>
+""", unsafe_allow_html=True)
+
+col1, col2 = st.columns([10,1])
+
+with col2:
+    if st.button("🔊" if st.session_state.sound_on else "🔇"):
+        st.session_state.sound_on = not st.session_state.sound_on
+
+
+# =========================
 # REAÇÃO
 # =========================
-reactions=[]
+reactions = []
 
-def check(level,name):
+def check(level, name):
     dist = price - level
 
     if prev_price < level and price > level:
@@ -185,25 +322,36 @@ def check(level,name):
     elif abs(dist) < 20:
         reactions.append(f"⚠️ Rejeição em {name} ({int(level)})")
 
-check(call_wall,"CALL WALL")
-check(put_wall,"PUT WALL")
+# chamadas
+check(call_wall, "CALL WALL")
+check(put_wall, "PUT WALL")
 
 for lvl in flow_inst:
-    check(lvl,"FLOW INST")
+    check(lvl, "FLOW INST")
 
 for lvl in gex_inst:
-    check(lvl,"GEX INST")
+    check(lvl, "GEX INST")
 
+
+# =========================
+# ALERTA + SOM
+# =========================
 if reactions:
-    for r in reactions:
-        st.info(r)
+    current_alert = "|".join(reactions)
 
-    st.markdown("""
-<script>
-var audio = new Audio("https://www.soundjay.com/buttons/sounds/button-09.mp3");
-audio.play();
-</script>
-""", unsafe_allow_html=True)
+    if current_alert != st.session_state.last_alert:
+        st.session_state.last_alert = current_alert
+
+        for r in reactions:
+            st.info(r)
+
+        if st.session_state.sound_on and st.session_state.audio_enabled:
+            components.html(f"""
+                <script>
+                const audio = new Audio("https://www.soundjay.com/buttons/sounds/button-09.mp3?{time.time()}");
+                audio.play();
+                </script>
+            """, height=0)
 
 # =========================
 # NORMALIZAÇÃO
